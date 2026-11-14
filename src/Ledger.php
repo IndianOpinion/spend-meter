@@ -21,7 +21,7 @@ final class Ledger
 {
     public const BUFFER_LIMIT = 100;
 
-    /** @var list<array{0: string, 1: array<string, mixed>, 2: int}> */
+    /** @var list<array{0: string, 1: array<string, mixed>, 2: int, 3: array<string, mixed>|null}> */
     private array $buffer = [];
 
     private bool $shutdownHooked = false;
@@ -60,7 +60,14 @@ final class Ledger
             Logger::error('record_invalid', 'record rejected: ' . $e->getMessage());
             return -1;
         } catch (Throwable $e) {
+            // Money was spent and nothing could be written: count the loss so
+            // the widget shows it.
             Logger::error('record_failed', 'record could not be prepared: ' . $e->getMessage());
+            try {
+                $this->counters->loss();
+            } catch (Throwable) {
+                // Nothing more can be done.
+            }
             return 0;
         }
     }
@@ -104,16 +111,23 @@ final class Ledger
         $buffer = $this->buffer;
         $this->buffer = [];
         $lost = 0;
-        foreach ($buffer as [$op, $row, $id]) {
+        foreach ($buffer as [$op, $row, $id, $fallback]) {
             try {
-                if ('insert' === $op) {
-                    $existing = $this->store->findByCallId((string) $row['call_id']);
-                    $newId = null === $existing ? $this->store->insert($row) : (int) $existing['id'];
-                    $this->recorded($newId, $row);
-                } else {
-                    $this->store->updateIf($id, $row, 'status', ['reserved', 'expired']);
+                if ('settle' === $op && $this->store->updateIf($id, $row, 'status', ['reserved', 'expired'])) {
                     $this->recorded($id, $row);
+                    continue;
                 }
+                if ('settle' === $op) {
+                    // Settled or released by someone else since: this attempt
+                    // still cost money, so it gets its own row.
+                    if (null === $fallback) {
+                        throw new StoreException('reservation no longer open and no row to insert');
+                    }
+                    $row = $fallback;
+                }
+                $existing = $this->store->findByCallId((string) $row['call_id']);
+                $newId = null === $existing ? $this->store->insert($row) : (int) $existing['id'];
+                $this->recorded($newId, $row);
             } catch (Throwable $e) {
                 $lost++;
                 Logger::error('record_loss', 'ledger write lost after retry: ' . $e->getMessage());
@@ -158,7 +172,7 @@ final class Ledger
             // that the shutdown retry will write.
             Logger::error('record_failed', 'ledger read failed: ' . $e->getMessage());
             $row = $this->buildRow($call, null, 'insert');
-            return $this->buffer('insert', $row, 0);
+            return $this->buffer('insert', $row, 0, null);
         }
 
         $mode = 'insert';
@@ -186,10 +200,19 @@ final class Ledger
                 }
             } catch (StoreException $e) {
                 Logger::error('record_failed', 'settle failed: ' . $e->getMessage());
-                return $this->buffer('settle', $fields, $id);
+                return $this->buffer('settle', $fields, $id, $this->buildRow($call, $reservation, 'linked'));
             }
-            // Settled by someone else in the meantime: this attempt gets its own linked row.
-            $row = $this->buildRow($call, $reservation, 'linked');
+            // Settled or released by someone else in the meantime. A settled
+            // reservation gets a linked row (case 18); a released one means
+            // this attempt is unreserved (case 19).
+            try {
+                $now = $this->store->find($id);
+            } catch (StoreException) {
+                $now = null;
+            }
+            $row = null !== $now && 'released' === $now['status']
+                ? $this->buildRow($call, $reservation, 'insert')
+                : $this->buildRow($call, $reservation, 'linked');
         }
 
         try {
@@ -204,7 +227,7 @@ final class Ledger
                 // Fall through to the buffer.
             }
             Logger::error('record_failed', 'insert failed: ' . $e->getMessage());
-            return $this->buffer('insert', $row, 0);
+            return $this->buffer('insert', $row, 0, null);
         }
         $this->recorded($id, $row + ['id' => $id]);
         $this->afterWrite($row);
@@ -301,7 +324,11 @@ final class Ledger
         if (!$hasUsage && null === $call['provider_cost'] && 'error_unbilled' !== $status) {
             $flags |= Schema::FLAG_USAGE_MISSING;
         }
-        $isTest = $call['test'] || (null !== $reservation && 1 === (int) $reservation['is_test']);
+        // The check decided whether this is a test: a live reservation counted
+        // toward the caps and must not turn into a test row on record.
+        $isTest = null !== $reservation && 'insert' !== $mode
+            ? 1 === (int) $reservation['is_test']
+            : $call['test'];
         $meta = $call['meta'];
 
         return [
@@ -341,9 +368,10 @@ final class Ledger
     }
 
     /**
-     * @param array<string, mixed> $row
+     * @param array<string, mixed>      $row
+     * @param array<string, mixed>|null $fallback For a settle: the linked row to insert if the reservation is no longer open.
      */
-    private function buffer(string $op, array $row, int $id): int
+    private function buffer(string $op, array $row, int $id, ?array $fallback): int
     {
         if (count($this->buffer) >= self::BUFFER_LIMIT) {
             Logger::error('record_loss', 'record buffer full; a ledger write was lost');
@@ -354,7 +382,7 @@ final class Ledger
             }
             return 0;
         }
-        $this->buffer[] = [$op, $row, $id];
+        $this->buffer[] = [$op, $row, $id, $fallback];
         if (!$this->shutdownHooked) {
             $this->shutdownHooked = true;
             add_action('shutdown', [$this, 'flush'], 1);

@@ -121,6 +121,29 @@ final class WpdbStoreMysqlTest extends TestCase
         $this->assertSame(self::n('0.006'), $totals['purposes']['a_b*']['day'], 'underscore is literal, not a wildcard');
     }
 
+    public function testNetworkCapBurstAndReleaseRaceOnRealSql(): void
+    {
+        \WpStub::$multisite = true;
+        $this->refresh();
+        Options::set(Options::DB_VERSION, Schema::VERSION);
+        $this->price('acme', 'text-1', '2', '8');
+        $this->plugin->caps()->set('network', 1, null, self::n('0.02'), null);
+        $allowed = 0;
+        for ($i = 0; $i < 5; $i++) {
+            $allowed += $this->check()['allowed'] ? 1 : 0;
+        }
+        $this->assertSame(3, $allowed, 'three reservations of 0.006 fit under 0.02, the cache never lets a fourth through');
+        $this->assertSame(['day' => self::n('0.018'), 'month' => self::n('0.018')], $this->wpdbStore->networkTotals($this->clock->day(), $this->clock->month(), $this->clock->utc(-900)));
+        $first = $this->wpdbStore->findByReservationId((string) $this->wpdbStore->reservations(1)[0]['reservation_id']);
+        $this->assertNotNull($first);
+        $this->assertTrue(spend_meter_release((string) $first['reservation_id']));
+        $id = spend_meter_record(['reservation_id' => $first['reservation_id'], 'status' => 'ok', 'input_tokens' => 10]);
+        $row = $this->wpdbStore->find($id);
+        $this->assertSame('1', (string) ((int) $row['flags'] & Schema::FLAG_UNRESERVED));
+        $this->assertNull($row['reservation_id']);
+        $this->assertSame('released', $this->wpdbStore->find((int) $first['id'])['status']);
+    }
+
     public function testNetworkTotalsAndUnpricedModels(): void
     {
         spend_meter_record(['purpose' => 'a', 'caller' => 'b', 'provider' => 'acme', 'model' => 'mystery', 'status' => 'ok', 'input_tokens' => 1]);

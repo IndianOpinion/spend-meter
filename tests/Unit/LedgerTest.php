@@ -278,6 +278,53 @@ final class LedgerTest extends TestCase
         $this->assertSame('ok', $this->row(1)['status']);
     }
 
+    public function testT26BufferedSettleOnAReservationSettledMeanwhileAddsALinkedRow(): void
+    {
+        $d = $this->check();
+        $this->store->failWrites = true;
+        $this->assertSame(0, $this->record(['reservation_id' => $d['reservation_id'], 'input_tokens' => 1]));
+        $this->store->failWrites = false;
+        // Another attempt settles the reservation before the shutdown retry.
+        $this->assertSame(1, $this->record(['reservation_id' => $d['reservation_id'], 'input_tokens' => 2]));
+        $this->plugin->ledger()->flush();
+        $this->assertCount(2, $this->store->all());
+        $this->assertSame(1, $this->row(2)['parent_id']);
+        $this->assertSame(1, $this->row(2)['input_tokens']);
+        $this->assertSame(0, $this->plugin->counters()->losses()['count']);
+    }
+
+    public function testT19SettleRacingAReleaseIsRecordedUnreserved(): void
+    {
+        $d = $this->check();
+        // The release lands between the record's lookup and its settle.
+        $reservationId = (string) $d['reservation_id'];
+        $this->store->beforeUpdate = static function () use ($reservationId): void {
+            spend_meter_release($reservationId);
+        };
+        $id = $this->record(['reservation_id' => $d['reservation_id'], 'input_tokens' => 10]);
+        $row = $this->row($id);
+        $this->assertNotSame(1, $id);
+        $this->assertSame(Schema::FLAG_UNRESERVED, $row['flags'] & Schema::FLAG_UNRESERVED);
+        $this->assertSame('summary', $row['purpose']);
+        $this->assertSame('released', $this->row(1)['status']);
+    }
+
+    public function testRecordThatCannotBePreparedCountsALoss(): void
+    {
+        add_filter('spend_meter_price', static function (): never {
+            throw new \RuntimeException('price filter broke');
+        });
+        $this->assertSame(0, $this->record(['purpose' => 'a', 'caller' => 'b', 'provider' => 'acme', 'model' => 'text-1']));
+        $this->assertSame(1, $this->plugin->counters()->losses()['count']);
+    }
+
+    public function testT15LiveReservationCannotTurnIntoATestRowOnRecord(): void
+    {
+        $d = $this->check();
+        $id = $this->record(['reservation_id' => $d['reservation_id'], 'input_tokens' => 10, 'test' => true]);
+        $this->assertSame(0, (int) $this->row($id)['is_test']);
+    }
+
     public function testT27DuplicateCallIdReturnsFirstId(): void
     {
         $base = ['purpose' => 'a', 'caller' => 'b', 'provider' => 'acme', 'model' => 'text-1', 'call_id' => self::CALL_ID];

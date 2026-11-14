@@ -30,6 +30,8 @@ final class MemoryStore implements Store
     public bool $dropped = false;
     /** @var Closure(): void|null */
     public ?Closure $afterInsert = null;
+    /** @var Closure(): void|null Runs once at the start of the next updateIf(). */
+    public ?Closure $beforeUpdate = null;
 
     public function insert(array $row): int
     {
@@ -62,6 +64,11 @@ final class MemoryStore implements Store
 
     public function updateIf(int $id, array $fields, string $column, array $allowed): bool
     {
+        if (null !== $this->beforeUpdate) {
+            $callback = $this->beforeUpdate;
+            $this->beforeUpdate = null;
+            $callback();
+        }
         $this->queries++;
         if ($this->failWrites) {
             throw new StoreException('injected write failure');
