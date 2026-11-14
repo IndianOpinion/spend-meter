@@ -143,11 +143,15 @@ final class DecisionTest extends TestCase
         $this->assertTrue($this->logged('allowing unpriced model'));
     }
 
-    public function testT6UnpricedAllowedWhenNoCapIsSetAtAll(): void
+    public function testT6UnpricedDeniedByDefaultEvenWithNoCap(): void
     {
         $d = $this->check(['model' => 'unknown-9']);
-        $this->assertTrue($d['allowed']);
-        $this->assertSame(Schema::FLAG_UNPRICED_ALLOWED, $this->store->all()[0]['flags']);
+        $this->assertFalse($d['allowed']);
+        $this->assertSame('unpriced_model', $d['reason']);
+        $this->assertNull($d['reservation_id']);
+        $this->assertSame([], $this->store->all());
+        // A test intent is still allowed (case 15).
+        $this->assertTrue($this->check(['model' => 'unknown-9', 'test' => true])['allowed']);
     }
 
     public function testT6UnpricedWithOverrideUsesOverride(): void
@@ -495,9 +499,58 @@ final class DecisionTest extends TestCase
         $this->assertTrue($this->check()['allowed']);
         // A stale cache that says the network is over the cap: the deny path
         // recomputes live and allows.
-        WpStub::$cache['spend_meter:spend_meter_network_2026-11-14'] = ['day' => self::n('5'), 'month' => self::n('5')];
+        WpStub::$cache['spend_meter:spend_meter_network_2026-11-14_1'] = ['day' => self::n('5'), 'month' => self::n('5')];
         $this->store->rows = [];
         $this->assertTrue($this->check()['allowed']);
+    }
+
+    public function testRuling4CachedNetworkTotalStillCountsThisSitesBurst(): void
+    {
+        WpStub::$multisite = true;
+        $this->refresh();
+        Options::set(Options::DB_VERSION, Schema::VERSION);
+        $this->price('acme', 'text-1', '2', '8');
+        // Each check reserves 0.006; the network day cap is 0.02, so three fit.
+        $this->plugin->caps()->set('network', 1, null, self::n('0.02'), null);
+        $this->assertTrue($this->check()['allowed']);
+        $this->assertTrue($this->check()['allowed']);
+        $this->assertTrue($this->check()['allowed']);
+        // The cache was filled by the first check, but this site's own
+        // reservations are read live, so the fourth is denied, not let through.
+        $d = $this->check();
+        $this->assertSame('cap_network_day', $d['reason']);
+        $this->assertSame(3, count($this->store->all()));
+    }
+
+    public function testRuling4CachedPartOfOtherSitesIsUsed(): void
+    {
+        WpStub::$multisite = true;
+        $this->refresh();
+        Options::set(Options::DB_VERSION, Schema::VERSION);
+        $this->price('acme', 'text-1', '2', '8');
+        $this->plugin->caps()->set('network', 1, null, self::n('1'), null);
+        // Other sites spent 0.995 according to the cache: 0.995 + 0.006 > 1.
+        WpStub::$cache['spend_meter:spend_meter_network_2026-11-14_1'] = ['day' => self::n('0.995'), 'month' => self::n('0.995')];
+        WpStub::$blogId = 2;
+        $this->assertSame(1, $this->record(['purpose' => 'summary', 'caller' => 'other', 'provider' => 'acme', 'model' => 'text-1', 'provider_cost' => self::n('0.995')]));
+        WpStub::$blogId = 1;
+        $this->assertSame('cap_network_day', $this->check()['reason']);
+        // Live recompute on the deny path confirms it, and nothing was reserved.
+        $this->assertSame(1, count($this->store->all()));
+    }
+
+    public function testT45KillSwitchAndCapsAreReadPastThisProcessOptionCache(): void
+    {
+        // A long-running worker holds stale local copies; every check drops them.
+        WpStub::$cache['options:spend_meter_kill'] = ['global' => false, 'purposes' => []];
+        WpStub::$cache['options:notoptions'] = ['spend_meter_caps' => true, 'other' => true];
+        $this->check();
+        $this->assertArrayNotHasKey('options:spend_meter_kill', WpStub::$cache);
+        $this->assertSame(['other' => true], WpStub::$cache['options:notoptions']);
+        WpStub::$multisite = true;
+        WpStub::$cache['site-options:1:spend_meter_caps'] = [];
+        $this->check();
+        $this->assertArrayNotHasKey('site-options:1:spend_meter_caps', WpStub::$cache);
     }
 
     public function testT73DecisionFilterThrowing(): void

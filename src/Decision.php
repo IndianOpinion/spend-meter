@@ -52,7 +52,8 @@ final class Decision
      */
     public function check(array $intent): array
     {
-        $dryRun = true === ($intent['dry_run'] ?? false);
+        // Same truthy values the validator accepts for dry_run.
+        $dryRun = in_array($intent['dry_run'] ?? false, [true, 1, '1'], true);
         try {
             [$decision, $reservationRowId] = $this->decide($intent);
         } catch (Throwable $e) {
@@ -88,12 +89,12 @@ final class Decision
     {
         try {
             $clean = Validator::intent($intent);
+            $price = $this->prices->lookup($clean['provider'], $clean['model']);
+
+            return $this->estimateFor($clean, $price);
         } catch (ValidationException) {
             return 0;
         }
-        $price = $this->prices->lookup($clean['provider'], $clean['model']);
-
-        return $this->estimateFor($clean, $price);
     }
 
     /**
@@ -102,6 +103,7 @@ final class Decision
      */
     private function decide(array $intent): array
     {
+        Options::refresh(Options::KILL, Options::CAPS);
         if ($this->kill->globalOn()) {
             return [$this->deny('kill_switch', 'the global kill switch is on', 0, null), null];
         }
@@ -128,10 +130,10 @@ final class Decision
         }
         $flags = 0;
         if (null === $price && null === $clean['estimate_override'] && !$clean['test']) {
-            if (!$this->settings->all()['allow_unpriced'] && $this->caps->anySet($blogId)) {
+            if (!$this->settings->all()['allow_unpriced']) {
                 return [$this->deny(
                     'unpriced_model',
-                    sprintf('no price for %s %s and caps are set; load prices or allow unpriced models', $clean['provider'], $clean['model']),
+                    sprintf('no price for %s %s; load prices or allow unpriced models', $clean['provider'], $clean['model']),
                     0,
                     null
                 ), null];
@@ -187,7 +189,7 @@ final class Decision
             $totals = $this->store->windowTotals($blogId, $day, $month, array_keys($anyPurpose), $liveSince);
             $network = null;
             if ($hasCap($networkCap)) {
-                $network = $this->networkTotals($day, $month, $liveSince, $estimate, $rowId !== null, false);
+                $network = $this->networkTotals($blogId, $day, $month, $liveSince, $totals, $own, false);
             }
         } catch (StoreException $e) {
             Logger::error('reserve', 'reservation or totals failed: ' . $e->getMessage());
@@ -216,7 +218,7 @@ final class Decision
             // The network total may come from the 60-second cache: recompute
             // live before denying on it.
             try {
-                $network = $this->networkTotals($day, $month, $liveSince, $estimate, $rowId !== null, true);
+                $network = $this->networkTotals($blogId, $day, $month, $liveSince, $totals, $own, true);
             } catch (StoreException $e) {
                 $this->dropReservation($rowId);
                 return [$this->deny('ledger_unavailable', 'the ledger could not be read', $estimate, null), null];
@@ -283,33 +285,53 @@ final class Decision
     }
 
     /**
-     * Network totals: from a 60-second cache when possible, plus this
-     * call's estimate; live when $live is true or the cache is cold.
+     * Network totals for the cap check.
      *
+     * The 60-second cache holds the network total minus this blog's own
+     * total at the time it was computed ("the other sites"). The figure used
+     * is that cached part plus this blog's live total, which already holds
+     * this call's reservation, so a burst on this blog is always counted at
+     * once; only other sites' spend inside the last minute can be missed.
+     * $own is this call's estimate when it holds no reservation (dry run).
+     * Live when $live is true or the cache is cold.
+     *
+     * @param  array{site_day: int, site_month: int, purposes: array<string, array{day: int, month: int}>} $site
      * @return array{day: int, month: int}
      */
-    private function networkTotals(string $day, string $month, string $liveSince, int $estimate, bool $reserved, bool $live): array
+    private function networkTotals(int $blogId, string $day, string $month, string $liveSince, array $site, int $own, bool $live): array
     {
-        $key = 'spend_meter_network_' . $day;
+        $key = self::networkCacheKey($day, $blogId);
         if (!$live) {
             $cached = wp_cache_get($key, 'spend_meter');
-            if (false === $cached) {
+            if (false === $cached && !wp_using_ext_object_cache()) {
                 $cached = get_site_transient($key);
             }
             if (is_array($cached) && is_int($cached['day'] ?? null) && is_int($cached['month'] ?? null)) {
-                return ['day' => Money::add($cached['day'], $estimate), 'month' => Money::add($cached['month'], $estimate)];
+                return [
+                    'day' => Money::add($cached['day'], $site['site_day'], $own),
+                    'month' => Money::add($cached['month'], $site['site_month'], $own),
+                ];
             }
         }
         $totals = $this->store->networkTotals($day, $month, $liveSince);
-        wp_cache_set($key, $totals, 'spend_meter', self::NETWORK_CACHE_TTL);
+        $others = [
+            'day' => max(0, $totals['day'] - $site['site_day']),
+            'month' => max(0, $totals['month'] - $site['site_month']),
+        ];
+        wp_cache_set($key, $others, 'spend_meter', self::NETWORK_CACHE_TTL);
         if (!wp_using_ext_object_cache()) {
-            set_site_transient($key, $totals, self::NETWORK_CACHE_TTL);
-        }
-        if (!$reserved) {
-            $totals = ['day' => Money::add($totals['day'], $estimate), 'month' => Money::add($totals['month'], $estimate)];
+            set_site_transient($key, $others, self::NETWORK_CACHE_TTL);
         }
 
-        return $totals;
+        return ['day' => Money::add($totals['day'], $own), 'month' => Money::add($totals['month'], $own)];
+    }
+
+    /**
+     * Cache key of the network total (other sites) for one blog and day.
+     */
+    public static function networkCacheKey(string $day, int $blogId): string
+    {
+        return 'spend_meter_network_' . $day . '_' . $blogId;
     }
 
     /**

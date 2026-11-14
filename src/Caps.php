@@ -85,24 +85,6 @@ final class Caps
     }
 
     /**
-     * True when any cap is set for the blog (site or any purpose) or the network.
-     */
-    public function anySet(int $blogId): bool
-    {
-        $isSet = static fn (array $limit): bool => null !== $limit['day'] || null !== $limit['month'];
-        if ($isSet($this->site($blogId)) || $isSet($this->network())) {
-            return true;
-        }
-        foreach ($this->purposes($blogId) as $limit) {
-            if ($isSet($limit)) {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    /**
      * Set a cap. Only the windows given change; pass null to leave a window
      * as it is. Use unset() to remove.
      *

@@ -42,7 +42,7 @@ final class Notices
         }
         $prices = $plugin->prices();
         if ($prices->isEmpty()) {
-            $out[] = 'spend-meter: no prices loaded. Every model is unpriced, so calls are denied wherever a cap is set.'
+            $out[] = 'spend-meter: no prices loaded. Every model is unpriced, so every call is denied unless unpriced models are allowed.'
                 . ' Import your own dated prices under Settings, Spend meter, or with "wp spend-meter prices import".';
         }
         if ($prices->corrupt()) {

@@ -38,9 +38,9 @@ final class Uninstaller
         foreach ($blogIds as $blogId) {
             delete_site_transient('spend_meter_summary_' . $blogId);
             wp_cache_delete('spend_meter_summary_' . $blogId, 'spend_meter');
+            delete_site_transient(Decision::networkCacheKey($clock->day(), $blogId));
         }
         delete_site_transient('spend_meter_summary_network');
-        delete_site_transient('spend_meter_network_' . $clock->day());
         if (!$keep) {
             try {
                 $plugin->store()->drop();

@@ -358,7 +358,7 @@ final class SettingsPage
             $html .= $row(
                 'Allow unpriced models',
                 $check('allow_unpriced', $settings['allow_unpriced'])
-                    . '<p class="description">' . esc_html('Off: a model with no price is refused whenever a cap is set. On: allowed, recorded at zero cost, and logged.') . '</p>',
+                    . '<p class="description">' . esc_html('Off: a model with no price is refused. On: allowed, recorded at zero cost, and logged.') . '</p>',
                 'allow_unpriced'
             );
             $html .= $row('Default output allowance (tokens)', $input('default_output_tokens', (string) $settings['default_output_tokens'], 'number'), 'default_output_tokens');

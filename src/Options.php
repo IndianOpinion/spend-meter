@@ -39,6 +39,44 @@ final class Options
         return get_option($name, $default);
     }
 
+    /**
+     * Drop this process's in-memory copy of options, so the next read sees
+     * what another process wrote.
+     *
+     * Called at the start of every pre-spend check for the kill switch and
+     * the caps, which the admin screen or WP-CLI may change while a
+     * long-running worker keeps checking (PRD cases 38 and 45). Without a
+     * persistent object cache the local copy is dropped and the next read
+     * goes to the database; with one, the shared copy (which every write
+     * updates) is fetched past any local runtime copy.
+     */
+    public static function refresh(string ...$names): void
+    {
+        foreach ($names as $name) {
+            if (is_multisite()) {
+                $network = function_exists('get_current_network_id') ? (int) get_current_network_id() : 1;
+                self::forget($network . ':' . $name, $network . ':notoptions', 'site-options', $name);
+            } else {
+                self::forget($name, 'notoptions', 'options', $name);
+            }
+        }
+    }
+
+    private static function forget(string $key, string $notKey, string $group, string $name): void
+    {
+        if (wp_using_ext_object_cache()) {
+            wp_cache_get($key, $group, true);
+            wp_cache_get($notKey, $group, true);
+            return;
+        }
+        wp_cache_delete($key, $group);
+        $not = wp_cache_get($notKey, $group);
+        if (is_array($not) && isset($not[$name])) {
+            unset($not[$name]);
+            wp_cache_set($notKey, $not, $group);
+        }
+    }
+
     public static function set(string $name, mixed $value): void
     {
         if (is_multisite()) {
