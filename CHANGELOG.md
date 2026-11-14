@@ -16,6 +16,7 @@ The contract version `SPEND_METER_API` increases by one on every breaking change
 - Record action `spend_meter_record` and `spend_meter_record()`: one row per attempt, settle in place, linked retries, unreserved records, idempotent `call_id`, cost source precedence, account errors, fallback model, shutdown retry buffer.
 - Release action `spend_meter_release`, reservation lifetime with an hourly expiry task.
 - `spend_meter_usage_from_response()` for both common usage shapes, with cached and reasoning tokens as subsets.
+- Unpriced models denied by default (`unpriced_model`); the `allow_unpriced` setting lets them through, flagged and logged.
 - Price table: shipped format with no prices, operator overrides, import and export with dry-run diff, prefix rows, `price_version`, staleness, `reprice` for unpriced rows.
 - Cap alerts `spend_meter_cap_warning` and `spend_meter_cap_reached`, once per scope per window.
 - Dashboard widget, network widget, settings screen, admin notices.

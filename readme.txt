@@ -39,7 +39,7 @@ To run it as a must-use plugin, copy the folder to `wp-content/mu-plugins/spend-
 
 = Why are calls denied right after install? =
 
-No prices are loaded and a cap is set, so every model is unpriced. Import your prices, or turn on "Allow unpriced models" while you set up.
+No prices are loaded, so every model is unpriced, and unpriced models are denied by default. Import your prices, or turn on "Allow unpriced models" while you set up.
 
 = Where do prices come from? =
 

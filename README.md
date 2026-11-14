@@ -126,7 +126,7 @@ spend-meter ships no prices. Prices change, and a stale hard-coded table makes t
 - Read each price from the provider's own pricing page. Copy the list price per million tokens (and the cached-input, reasoning, unit and per-call prices where the provider has them).
 - Date every row (`as_of`) and keep the page you read it from (`source`). The admin screen flags rows older than the staleness threshold (120 days by default).
 - If you route through an aggregator, add a row for the aggregator's own model id. When the aggregator reports the billed cost in its response, that cost wins anyway and the table cost is kept beside it, so drift is visible.
-- A model with no row is unpriced. There is no default price. With any cap set, unpriced models are denied unless you turn on "Allow unpriced models".
+- A model with no row is unpriced. There is no default price. Unpriced models are denied (`unpriced_model`) unless you turn on "Allow unpriced models".
 
 The format is in [`docs/prices.example.json`](docs/prices.example.json). That file holds placeholders that fail validation on purpose, so it cannot be imported unread. Every price is a decimal string with at most nine places. A `model` ending in `*` matches by prefix; the longest prefix wins and an exact row always beats a prefix row.
 
@@ -155,7 +155,7 @@ Settings live under **Settings, Spend meter** (on multisite, site caps on each s
 | Purpose caps | none | Per purpose slug or `prefix*`; every matching pattern applies |
 | Network day and month caps | none | Multisite only |
 | Warning threshold | 80 percent | 1 to 99; fires `spend_meter_cap_warning` once per scope per window |
-| Allow unpriced models | off | Off: unpriced models are denied whenever a cap is set. On: allowed, recorded at zero cost, logged |
+| Allow unpriced models | off | Off: unpriced models are denied. On: allowed, recorded at zero cost, logged |
 | Default output allowance | 4,096 tokens | Used in the estimate when `max_output_tokens` is absent |
 | Reservation lifetime | 15 minutes | 1 to 120; filter `spend_meter_reservation_lifetime` |
 | Ledger currency | `USD` | Fixed once the ledger has rows; there is no conversion |
@@ -227,9 +227,7 @@ Reason codes: `ok`, `kill_switch`, `kill_switch_purpose`, `invalid_request`, `un
 
 ## FAQ
 
-**Why is every call denied right after install?** No prices are loaded and you set a cap, so every model is unpriced and denied. Import your prices, or turn on "Allow unpriced models" while you set up.
-
-**Why are calls allowed with no prices and no caps?** With no cap anywhere there is nothing to protect, so unpriced calls are allowed, recorded at zero cost and logged. Set a cap.
+**Why is every call denied right after install?** No prices are loaded, so every model is unpriced, and unpriced models are denied by default (`unpriced_model`). Import your prices, or turn on "Allow unpriced models" while you set up. Allowed unpriced calls are recorded at zero cost, flagged and logged.
 
 **Can another plugin turn a deny into an allow?** No. The `spend_meter_decision` filter can add rules that deny; a deny it tries to flip is ignored and logged.
 

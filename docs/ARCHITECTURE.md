@@ -53,7 +53,7 @@ plugin file, so the functions exist only while the plugin is active.
 7. No cap applies: reserve and allow, with `remaining` null. No sum query.
 8. Otherwise insert the reservation, then one aggregate query for the site
    and every matching purpose pattern, day and month. Network caps read the
-   cached network total (ruling 4).
+   cached total of the other sites plus this site's live total (ruling 4).
 9. Check caps in priority order; deny with the first failing reason and
    delete the caller's own reservation. Fire cap alerts.
 10. Pass the decision through `spend_meter_decision`; it can turn an allow
@@ -65,14 +65,20 @@ plugin file, so the functions exist only while the plugin is active.
 2. A known `call_id` returns the existing row id (idempotent).
 3. Look up the reservation by `reservation_id`:
    - `reserved` or `expired`: settle in place (conditional update on the
-     status, so two settles cannot both win; the loser becomes a linked row).
+     status, so two settles cannot both win; the loser becomes a linked row,
+     or an unreserved row when a release won the race).
    - settled: insert a linked row with `parent_id`.
    - `released` or unknown: insert with the `unreserved` flag.
+   - `is_test` comes from the reservation when there is one: a live
+     reservation that counted toward the caps never turns into a test row.
 4. Cost source: provider cost, then table, then the reservation estimate when
    no usage came back, then zero and `unpriced`. `error_unbilled` (including
    every 401, 402 and 403) stores cost zero.
 5. On a database error, buffer (100 per request) and retry at `shutdown`;
-   then log once per ten minutes and count the loss.
+   a buffered settle whose reservation was settled meanwhile is written as
+   its own linked row. If the retry fails, log once per ten minutes and
+   count the loss. A record that cannot be prepared at all (for example a
+   `spend_meter_price` filter that throws) returns 0 and counts a loss.
 6. Fire `spend_meter_recorded`. A listener that throws is caught and logged.
 
 ## Decisions
@@ -88,29 +94,38 @@ plugin file, so the functions exist only while the plugin is active.
    runs the real SQL against MySQL or MariaDB and is skipped unless
    `SPEND_METER_TEST_MYSQL_DSN` is set; CI runs it against a MySQL service.
    Reason: no SQLite dependency, fast unit runs, and the SQL is still tested.
-2. **Unpriced models.** Denied by default whenever any cap is set (a site
-   cap, any purpose cap of the site, or a network cap). The setting
-   `allow_unpriced` (default off) lets them through; the row is flagged
-   `unpriced_allowed`, recorded at zero cost, and a warning is logged (once
-   per provider and model per ten minutes). With no cap set anywhere,
-   unpriced calls are allowed and flagged the same way, because there is
-   nothing to protect; the first-run notice and the widget warning still say
-   "no prices loaded". Reason: the owner's ruling; the default stays closed
-   wherever the operator has asked for a limit.
+2. **Unpriced models.** Denied by default with `unpriced_model`, whether or
+   not any cap is set (PRD case 6). The setting `allow_unpriced` (default
+   off) is the PRD's unpriced policy: on, unpriced models are let through,
+   the row is flagged `unpriced_allowed`, recorded at zero cost, and a
+   warning is logged (once per provider and model per ten minutes). Because
+   the shipped table is empty, a fresh install denies every call until the
+   operator imports prices or turns the setting on; the first-run notice
+   and the widget warning say "no prices loaded". Test intents and intents
+   with an `estimate_override` are not subject to the policy. Reason: the
+   owner's ruling; lesson 14.4 (no silent default price) and the PRD's
+   fail-closed default.
 3. **Record return.** `spend_meter_record()` returns an int: the row id,
    0 when the write was buffered for a retry, -1 when the call array is
    invalid. No separate cost getter: the row id and `spend_meter_recorded`
    (which carries the whole row) give callers the cost. Reason: as the PRD
    states.
-4. **Network caps.** The network total is cached for 60 seconds in the
-   object cache, and in a site transient when there is no persistent cache.
-   A check adds its own estimate to the cached total. Only when that would
-   deny is the total recomputed live (and the cache refreshed) before the
-   decision. Reason: the network sum crosses every site and is the most
-   expensive query; recomputing on the deny path means a stale cache can
-   never cause a false deny. Accepted cost: the network cap can be passed by
-   up to a minute of other sites' spend. Site and purpose totals are always
-   live (lesson 14.11).
+4. **Network caps.** Cached for 60 seconds, per site and day, in the object
+   cache, and in a site transient when there is no persistent cache. The
+   cached figure is the network total minus the checking site's own total
+   at the time it was computed, that is, the other sites' spend. A check
+   uses that cached part plus its own site's live total, which the check
+   reads anyway and which already holds this call's reservation. Only when
+   that would deny is the network total recomputed live (and the cache
+   refreshed) before the decision. Reason: the network sum crosses every
+   site and is the most expensive query; recomputing on the deny path means
+   a stale cache can never cause a false deny, and reading the own site
+   live means a burst on one site can never pass the cap on a stale figure.
+   Accepted cost: the network cap can be passed by up to a minute of other
+   sites' spend. Site and purpose totals are always live (lesson 14.11).
+   (Review fix: the first build cached the whole network total and added
+   only the current estimate, so a burst on one site inside the minute
+   could pass the network cap by any amount.)
 5. **Seed file.** `data/prices.json` holds the format only: schema 1,
    `USD`, `as_of` null, an empty `prices` array. No price is shipped,
    quoted, or used in tests: fixtures use invented providers (`acme`,
@@ -139,7 +154,7 @@ plugin file, so the functions exist only while the plugin is active.
   the same. A nullable, indexed `reservation_id CHAR(36)` column was added.
   The reservation row and every linked retry carry it; lookup is "the row
   with this reservation id and no parent". Adding a column is not a breaking
-  change under PRD 5.1.
+  change under PRD 5.1. Recorded in PRD section 6.
 - **Covering indexes.** Measured on a test box (2 vCPU, a 32 MB InnoDB
   buffer pool, shared with another database), with 256,000 rows of which
   about 21,000 fall in the current month for the site: the totals query took
@@ -150,7 +165,8 @@ plugin file, so the functions exist only while the plugin is active.
   a covering `month_totals` index. The PRD's 5 ms budget is not met for
   ledgers with tens of thousands of rows per site per month on hardware like
   that; a per-day rollup table is the roadmap item. Timings will differ on
-  a production database with a normal buffer pool.
+  a production database with a normal buffer pool. Recorded in PRD
+  section 6.
 - **Pattern caps count the pattern.** A purpose cap on `shadow*` caps the
   total of every purpose that starts with `shadow`, not each purpose alone.
   The scope string is `purpose:<blog_id>:shadow*`.
@@ -164,6 +180,13 @@ plugin file, so the functions exist only while the plugin is active.
   cost more than its reservation (or had none) and a site or purpose cap
   applies. The common path, settling at or under the estimate, stays one
   write.
+- **Fresh kill switch and caps on every check.** WordPress keeps options in
+  a per-process cache, so a long-running worker (WP-CLI, a queue runner)
+  would not see a kill switch or a lowered cap set from the admin screen
+  until it restarted. Every pre-spend check first drops the process's copy
+  of the kill switch and caps options (without a persistent object cache)
+  or fetches them past the local runtime copy (with one). Cost: one small
+  read per option per check without a persistent cache.
 - **Options are network-wide.** There is one ledger per network, so caps,
   kill switches, settings and price overrides are one set per network: a
   network option on multisite, a normal option on a single site. Site caps
