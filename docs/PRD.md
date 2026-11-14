@@ -52,9 +52,10 @@ Goals:
    multisite.
 4. A global kill switch and a per-purpose kill switch, settable from the
    admin screen, WP-CLI, or a constant that the admin screen cannot undo.
-5. A configurable price table, seeded from public list prices with a
-   documented "as of" date and source per row, updatable without a code
-   release, and versioned so old rows are never silently repriced.
+5. A configurable price table, loaded by the operator from a file or the
+   admin screen with an "as of" date and source per row, updatable without
+   a code release, and versioned so old rows are never silently repriced.
+   The plugin ships the file format and no prices.
 6. A dashboard widget showing today, this month, caps, top purposes, and
    warnings (kill switch on, unpriced models, recent errors).
 7. WP-CLI commands for status, reports, caps, kill switches, prices,
@@ -120,7 +121,12 @@ Terms used below:
    array: `allowed` (bool), `reason` (code), `message` (text),
    `reservation_id` (string or null), `estimate` (cost in nanos),
    `remaining` (smallest remaining headroom across the caps checked, or
-   null when no cap applies).
+   null when no cap applies), `api` (the contract version, section 5.1).
+   Every deny also returns these keys: `allowed` false, `reservation_id`
+   null, `estimate` the computed estimate (0 when the intent was invalid or
+   no estimate could be made), `remaining` 0 for a cap deny and null
+   otherwise. spend-meter ignores any non-null value passed in and always
+   overwrites it. Unknown intent keys are ignored.
 2. If spend-meter is not active, the filter returns `null`. Callers treat
    `null` as "no meter present" and fall back to their own cap and kill
    switch. spend-meter never relies on callers having their own guards, and
@@ -131,10 +137,14 @@ Terms used below:
 4. If a per-purpose kill switch matches the purpose, deny with
    `kill_switch_purpose`. Purpose kill entries are exact slugs or a trailing
    `*` prefix pattern (`shadow*`). No other pattern syntax.
-5. If the intent is invalid (missing purpose, purpose not matching
-   `^[a-z0-9][a-z0-9_.-]{0,63}$`, model longer than 128 characters, negative
-   token estimates, non-numeric values), deny with `invalid_request`. Never
-   truncate silently.
+5. If the intent is invalid (a missing required key, purpose or caller not
+   matching `^[a-z0-9][a-z0-9_.-]{0,63}$`, provider not matching the same
+   pattern, model empty or longer than 128 characters, negative or
+   non-numeric numbers, `meta` outside its limits), deny with
+   `invalid_request`. Integer keys accept an integer or a string of digits;
+   floats, booleans and other strings are invalid. Never truncate
+   silently. Provider and model are lower-cased for price lookup and
+   stored as given. The `message` names the first bad key.
 6. If the model has no price row and the caller gave no `estimate_override`,
    apply the unpriced policy: `deny` (default) denies with `unpriced_model`;
    `allow` allows, records the estimate as zero, and flags the row.
@@ -161,32 +171,50 @@ Terms used below:
 12. A cap of zero denies every call in that scope. An empty cap means no
     cap.
 13. After spend-meter's own decision, the result passes through
-    `spend_meter_decision` so a site can add rules (office hours, a role
-    check). A filter may turn an allow into a deny; spend-meter then
-    releases the reservation. A filter that turns a deny into an allow is
+    `spend_meter_decision` (every decision, allow or deny) so a site can add
+    rules (office hours, a role check). A filter turns an allow into a deny
+    by returning the array with `allowed` false; spend-meter then sets
+    `reason` to `denied_by_filter`, keeps a string `message` if one was
+    set, sets `reservation_id` to null and releases the reservation. A filter that turns a deny into an allow is
     ignored and logged once per request, because caps and kill switches
     are not overridable from code paths other plugins control.
 14. A `dry_run` intent runs every check and returns the decision without
     writing a reservation. WP-CLI `check` uses it.
-15. A `test` intent (sandbox or local endpoint) is always allowed unless a
-    kill switch is on. Test rows are recorded with `is_test = 1` and never
-    count toward caps or the widget totals. Lesson: a test endpoint must
-    never cool or cap the live path.
+15. A `test` intent (sandbox or local endpoint) is validated like any
+    other, and is always allowed unless a kill switch is on, even when
+    unpriced or over a cap. It creates a reservation with `is_test = 1`
+    (unless `dry_run` is also set) so the later record settles it. The
+    estimate is computed when a price exists and is 0 otherwise. Test rows
+    never count toward caps or the widget totals, and an unreserved test
+    record does not raise the unreserved warning. Lesson: a test endpoint
+    must never cool or cap the live path.
 
 ### 4.2 Recording a call
 
 16. After every attempt, billed or not, the caller fires the action
     `spend_meter_record` with a call array (section 5.3), or calls
-    `spend_meter_record()` to get the row id back.
+    `spend_meter_record()` to get the row id back. A call array that fails
+    validation (missing required key, bad slug, status outside `ok`,
+    `error_billed`, `error_unbilled`, negative numbers) is not written; the
+    function returns -1 and the problem is logged. A caller may fire the
+    record for a `dry_run` decision's attempt: it is then an unreserved
+    record.
 17. If the call carries a `reservation_id` that exists and is still
-    `reserved`, that row is settled in place: status, tokens, cost and
-    latency are written, and the reservation is gone. One row per attempt.
+    `reserved`, or has been marked `expired` and not yet settled (the call
+    ran longer than the lifetime), that row is settled in place: status,
+    tokens, cost and latency are written, and the reservation is gone. Any
+    `provider`, `model` or `purpose` given in the call replaces the
+    reservation's value; the reservation's `model` is kept as
+    `fallback_from` when the call names a different model and gives none.
+    One row per attempt.
 18. A second record for the same reservation (a retry reusing the id)
     inserts a new row linked by `parent_id` and does not touch the first.
     Each attempt has its own row, as lesson 14.3 requires.
 19. A record without a reservation (the caller skipped the check, or
-    spend-meter was activated mid-request) is inserted as a new row with
-    `unreserved = 1`. The widget counts these as a warning.
+    spend-meter was activated mid-request, or the reservation id is unknown
+    or was `released`) is inserted as a new row with `unreserved = 1`. The
+    widget counts these as a warning. Money was spent, so such a record is
+    never dropped.
 20. Cost source, in this order:
     1. `provider_cost` given by the caller (the provider reported the
        billed amount): store it, `cost_source = provider`.
@@ -209,7 +237,8 @@ Terms used below:
     zero and count only in error statistics. Lesson: a 200 with a broken
     body is still billed.
 24. Account-level errors (the caller passes `http_status` 401, 402 or 403)
-    are stored as `error_unbilled` with `error_code` set. The widget shows
+    are stored as `error_unbilled` with `error_code` set, whatever `status`
+    the caller gave. The widget shows
     the last one ("provider refused: out of credit or bad key") so the
     operator sees it without reading logs.
 25. Fallback: if the caller fell back to another provider or model, the
@@ -217,12 +246,15 @@ Terms used below:
     `fallback_from` (the model first tried). One row per attempt, so the
     failed first attempt has its own row.
 26. Recording never throws into the caller and never blocks it. On a
-    database error the call is written to a bounded in-memory buffer and
+    database error the function returns 0, and the call is written to a
+    bounded in-memory buffer (100 calls per request) and
     retried at `shutdown`; if that fails, one `error_log` line per ten
     minutes and a counter option record the loss.
 27. Recording is idempotent on `call_id`. If the caller supplies a
     `call_id` (UUID) and a row with it exists, the second record is ignored
-    and the existing row id is returned.
+    and the existing row id is returned. A reservation id is never the
+    `call_id`: a retry that reuses a reservation id with a new `call_id`
+    makes a linked row (case 18).
 28. A record for a purpose that is kill-switched is still written. The
     ledger records what happened; the kill switch only stops new spend.
 
@@ -263,7 +295,11 @@ Terms used below:
     and fires `spend_meter_cap_warning` once per scope per window.
 40. Crossing a cap fires `spend_meter_cap_reached` once per scope per
     window, with the scope, window, limit and total. Sites hook mail or chat
-    alerts to it; spend-meter sends no mail itself.
+    alerts to it; spend-meter sends no mail itself. Both cap actions fire
+    from the pre-spend check (on a deny, or when an allow brings the total
+    to the threshold) and from a record that settles a row past the
+    threshold. "Once" is tracked in the option `spend_meter_alert_state`,
+    keyed by scope and window key, and pruned after two windows.
 41. Window boundaries follow the site timezone at check time. A row stores
     its own `day` and `month` when written, so a timezone change mid-day
     does not move old rows between days. DST changes need no special case.
@@ -289,10 +325,11 @@ Terms used below:
     sum excludes `reserved` rows older than the lifetime) and are marked
     `expired` by an hourly cron task and by WP-CLI.
 47. A caller that decides not to make the call fires
-    `spend_meter_release` with the reservation id. The row becomes
-    `released` with cost zero.
-48. Releasing or recording an unknown or already settled reservation is a
-    no-op with a debug log line, never an error to the caller.
+    `spend_meter_release` with the reservation id, or calls
+    `spend_meter_release()`. The row becomes `released` with cost zero.
+48. Releasing an unknown or already settled reservation is a no-op with a
+    debug log line, never an error to the caller. Recording is never a
+    no-op for these (cases 18 and 19), because the money was spent.
 
 ### 4.7 Price table
 
@@ -301,12 +338,19 @@ Terms used below:
     (all per million tokens), optional unit price and unit name (image,
     second, character, request), optional per-call fee, currency,
     `as_of` date and `source` URL.
-50. The plugin ships a seed file, `data/prices.json`, built from providers'
-    public list price pages. Each row carries the date the builder read the
-    page and the page URL. The file has a top-level `as_of` date (the
-    oldest row date) and a `schema` version. The README states the seed date
-    in its configuration section and says plainly that list prices change
-    and the operator must check them.
+50. The plugin ships a seed file, `data/prices.json`, that carries the file
+    format and no prices: `schema` 1, `currency`, `as_of` null and an empty
+    `prices` array. It is a valid file, so a fresh install has an empty
+    effective table and every model is unpriced until the operator imports
+    prices (case 55) or sets rows. No price from any provider is shipped,
+    quoted in the README or written in the tests (fixtures use invented
+    provider and model names and invented numbers). A documented example
+    file, `docs/prices.example.json`, shows the format with placeholder
+    strings that fail import validation on purpose, so nobody imports it
+    unread. The README explains where to read list prices (the provider's
+    own pricing page), that they change, and that the operator must check
+    and date every row. First-run guidance: an admin notice and a widget
+    warning say "no prices loaded" while the effective table is empty.
 51. Operator overrides are stored separately from the seed. The effective
     price for a model is the override if one exists, otherwise the seed
     row. Upgrading the plugin replaces the seed file and never touches
@@ -329,7 +373,8 @@ Terms used below:
 57. A price in a currency other than the ledger currency is rejected.
 58. The admin screen lists effective prices with their source (seed or
     override), `as_of` date, and an age warning when older than the
-    staleness threshold (default 120 days).
+    staleness threshold (default 120 days). An empty table shows the "no
+    prices loaded" notice instead.
 59. `reprice` fills cost for `unpriced` rows only, once a price exists, and
     marks them `cost_source = table_late`. It never changes any other row.
 
@@ -337,8 +382,8 @@ Terms used below:
 
 60. The widget shows: today's total and this month's total against the site
     caps (bars, numbers, percent), the top five purposes today by cost, the
-    kill switch state, and warnings: unpriced rows today, unreserved rows
-    today, the last account-level error, recording losses, a stale price
+    kill switch state, and warnings: no prices loaded, unpriced rows today,
+    unreserved rows today, the last account-level error, recording losses, a stale price
     table, and live reservations older than half their lifetime.
 61. Only users with the configured capability see it.
 62. Figures come from a summary cached for 60 seconds in the object cache
@@ -386,7 +431,7 @@ Terms used below:
 | Ledger table missing or unreadable during a check | Deny with `ledger_unavailable` | Closed: spending without a meter is the problem this plugin exists to stop |
 | Reservation insert fails | Deny with `ledger_unavailable` | Closed, same reason |
 | Settings option corrupt or unreadable | Use defaults, keep kill switch constants, log once | Closed for kill switches (constants still apply), open for caps only if the operator set none |
-| Price table option corrupt | Fall back to the seed file, log once, widget warns | Open with seed prices: the seed is a valid table |
+| Price table option corrupt | Fall back to the seed file (empty), log once, widget warns | Closed by default: models are unpriced until the operator re-imports |
 | Seed file missing or invalid | Every model is unpriced; unpriced policy applies | Closed by default (policy `deny`) |
 | Record database write fails | Buffer and retry at shutdown; then log and count | Never block the caller: the money is already spent |
 | Object cache down | Read totals from the database | Correctness does not depend on the cache |
@@ -397,15 +442,29 @@ Terms used below:
 ## 5. Public interface
 
 Stability: everything in this section is the public contract from 1.0.0.
-Before 1.0.0, minor versions may change it with a CHANGELOG entry. The
-constant `SPEND_METER_API` holds the contract version (start at `1`),
-bumped on any breaking change, so callers can check it.
+Before 1.0.0, minor versions may change it with a CHANGELOG entry.
 
-### 5.1 Detecting the meter
+### 5.1 Detecting the meter and the contract version
 
-- `function_exists('spend_meter_record')` or `defined('SPEND_METER_API')`.
+- The constant `SPEND_METER_API` is an integer holding the contract
+  version. It is `1` in 0.1.0. It only ever increases, by one, on a
+  breaking change, including a breaking change made before 1.0.0. A
+  breaking change is: removing or renaming a hook, function, key, column
+  or reason code, changing a type or the meaning of a value, or adding a
+  required intent or call key. Adding an optional key, a reason code, a
+  hook or a function is not breaking. The plugin version is a separate
+  string constant, `SPEND_METER_VERSION`.
+- The constant is defined when the plugin file loads, before
+  `plugins_loaded`, and every function and hook in this section is
+  registered at the same moment. A caller that runs on `plugins_loaded` or
+  later can rely on them. A caller that runs earlier must treat the meter
+  as absent.
+- Detect with `defined('SPEND_METER_API')`. A caller built for contract `N`
+  works while the constant equals `N`. If it is greater, read the CHANGELOG
+  before assuming; if it is lower, treat the meter as absent. Every
+  decision array also carries the same number in `api`.
 - Callers should use only the filters and actions when they want zero
-  coupling; the functions are conveniences.
+  coupling; the functions are conveniences with the same behaviour.
 
 ### 5.2 Pre-spend filter
 
@@ -428,10 +487,18 @@ Intent keys:
 | `test` | bool | no | Sandbox call, not counted |
 | `meta` | array | no | Up to 8 scalar key/value pairs, keys `^[a-z0-9_]{1,32}$`, values up to 191 chars, stored as JSON. No content. |
 
-Decision keys: `allowed` (bool), `reason` (string code), `message`
-(string, for logs, never for end users), `reservation_id` (string UUID or
-null), `estimate` (int nanos), `remaining` (int nanos or null),
-`api` (int contract version).
+Decision keys, always all present on a non-null result: `allowed` (bool),
+`reason` (string code), `message` (string, for logs, never for end users),
+`reservation_id` (string UUID, null unless allowed and not `dry_run`),
+`estimate` (int nanos), `remaining` (int nanos, or null when no cap
+applies), `api` (int contract version).
+
+Caller protocol: if the result is `null`, no meter is present; use the
+caller's own guards. If `allowed` is not exactly `true`, do not make the
+call. If it is `true` and `reservation_id` is a string, then exactly one of
+`spend_meter_record` or `spend_meter_release` must follow for that id.
+Pass the id back as `reservation_id`. A decision for a `dry_run` or a
+denied check holds nothing.
 
 Reason codes: `ok`, `kill_switch`, `kill_switch_purpose`,
 `invalid_request`, `unpriced_model`, `cap_purpose_day`,
@@ -440,8 +507,12 @@ Reason codes: `ok`, `kill_switch`, `kill_switch_purpose`,
 `decision_filter_error`. New codes may be added in minor versions; callers
 must treat any unknown code as a deny.
 
+`message` text is not a contract; only the reason codes are. A caller
+reads `allowed` first and `reason` second.
+
 Function form: `spend_meter_check( array $intent ): array` (same result,
-never null).
+never null, same filters applied). It exists only when the plugin is
+active.
 
 ### 5.3 Record action
 
@@ -466,19 +537,23 @@ Call keys:
 | `test` | bool | no | |
 | `meta` | array | no | As in the intent |
 
-Function form: `spend_meter_record( array $call ): int` returns the row id,
-or 0 when buffered for a retry.
+The action returns nothing. Function form: `spend_meter_record( array $call ): int`
+returns the row id (settled or inserted, or the existing row for a
+duplicate `call_id`), 0 when the write failed and the call was buffered
+for a retry, or -1 when the call array is invalid and nothing was written.
+It never throws. `status` values `released` and `expired` are set only by
+spend-meter and are invalid here. Unknown call keys are ignored.
 
 ### 5.4 Other actions and filters
 
 | Hook | Kind | Arguments | Purpose |
 |---|---|---|---|
-| `spend_meter_release` | action | `string $reservation_id` | Give up a reservation |
-| `spend_meter_decision` | filter | `array $decision, array $intent` | Add site rules; can only deny |
-| `spend_meter_recorded` | action | `int $row_id, array $row` | After a row is written or settled |
-| `spend_meter_cap_warning` | action | `string $scope, string $window, int $limit, int $total` | Threshold crossed |
-| `spend_meter_cap_reached` | action | same | Cap crossed |
-| `spend_meter_kill_switch_changed` | action | `string $scope, bool $old, bool $new, string $actor` | Switch flipped |
+| `spend_meter_release` | action | `string $reservation_id` | Give up a reservation. Function form `spend_meter_release( string $reservation_id ): bool`, true when a live reservation was released, false for a no-op |
+| `spend_meter_decision` | filter | `array $decision, array $intent` | Add site rules; can only deny. Must return the decision array; any other return value is treated as an exception (`decision_filter_error`) |
+| `spend_meter_recorded` | action | `int $row_id, array $row` | After a row is written or settled. `$row` is keyed by the ledger column names in section 6 |
+| `spend_meter_cap_warning` | action | `string $scope, string $window, int $limit, int $total, string $window_key` | Threshold crossed. `$scope` is `site:<blog_id>`, `purpose:<blog_id>:<slug or pattern>` or `network`. `$window` is `day` or `month`. `$window_key` is `YYYY-MM-DD` or `YYYY-MM`. Limit and total are nanos |
+| `spend_meter_cap_reached` | action | same | Cap crossed, same argument shapes |
+| `spend_meter_kill_switch_changed` | action | `string $scope, bool $old, bool $new, string $actor` | Switch flipped from the screen or CLI (never for a constant). `$scope` is `global` or `purpose:<slug or pattern>`. `$actor` is the user id as a string, or `cli` |
 | `spend_meter_capability` | filter | `string $cap` | Default `manage_options` |
 | `spend_meter_default_settings` | filter | `array $defaults` | Change any default in section 7 |
 | `spend_meter_price` | filter | `?array $price, string $provider, string $model` | Last-chance price lookup override |
@@ -488,12 +563,16 @@ or 0 when buffered for a retry.
 
 - `spend_meter_usage_from_response( array $body ): array` (section 4.3).
 - `spend_meter_estimate( array $intent ): int` estimate in nanos without
-  any checks.
+  any checks; 0 when the model is unpriced and no override is given.
 - `spend_meter_totals( string $scope, string $window, ?string $purpose = null, ?int $blog_id = null ): int`
   current window total in nanos, settled plus live reservations, tests
-  excluded.
+  excluded. `$scope` is `site`, `purpose` or `network`; `$window` is `day`
+  or `month`; `$purpose` is required for `purpose` and an exact slug.
+  An invalid argument returns 0 and logs.
 - `spend_meter_format( int $nanos ): string` money for display.
-- `spend_meter_kill_active( ?string $purpose = null ): bool`.
+- `spend_meter_kill_active( ?string $purpose = null ): bool`, true when the
+  global switch is on, or when `$purpose` is given and matches a purpose
+  entry.
 
 Money is always an integer number of nanos (one billionth of the ledger
 currency unit) in the API and the table. This keeps sums exact. Prices in
@@ -511,7 +590,7 @@ Command root: `wp spend-meter`.
 
 | Command | Does |
 |---|---|
-| `status` | Kill switches, today and month totals against caps, live reservations, unpriced rows today, last error, timezone, seed date |
+| `status` | Kill switches, today and month totals against caps, live reservations, unpriced rows today, last error, timezone, oldest effective price date (or "no prices loaded") |
 | `report [--from=<date>] [--to=<date>] [--by=purpose\|model\|caller\|provider\|day] [--include-tests]` | Totals and token counts grouped |
 | `check --purpose=<p> --caller=<c> --provider=<x> --model=<m> [--in=<n>] [--out=<n>]` | Dry-run decision |
 | `caps list` / `caps set <scope> [<purpose>] [--day=<amount>] [--month=<amount>]` / `caps unset ...` | Manage caps; scope is `site`, `purpose` or `network` |
@@ -529,7 +608,7 @@ Amounts on the command line are decimal strings in the ledger currency.
 Options (all under one prefix `spend_meter_`, autoload off except the
 settings array): `spend_meter_settings`, `spend_meter_caps`,
 `spend_meter_kill`, `spend_meter_prices_override`,
-`spend_meter_db_version`, `spend_meter_last_cron`,
+`spend_meter_db_version`, `spend_meter_alert_state`, `spend_meter_last_cron`,
 `spend_meter_record_losses`. Network options for network caps on multisite.
 
 Constants: `SPEND_METER_KILL` (bool), `SPEND_METER_KILL_PURPOSES`
@@ -582,8 +661,10 @@ After a schema upgrade the plugin verifies every expected column with
 `SHOW COLUMNS` and, if one is missing, shows an admin notice and denies
 with `ledger_unavailable` until it is fixed (lesson 14.9).
 
-Prices: seed in `data/prices.json` (read-only, shipped); overrides in the
-option `spend_meter_prices_override`. Seed file shape:
+Prices: seed in `data/prices.json` (read-only, shipped, empty `prices`
+array, section 4.7 case 50); overrides in the option
+`spend_meter_prices_override`. The same shape is the import and export
+format. Example shape (placeholders, not prices):
 
 ```json
 {
@@ -608,10 +689,12 @@ option `spend_meter_prices_override`. Seed file shape:
 }
 ```
 
-The builder fills the seed from public list price pages on the build date,
-covering the current general-purpose text, embedding and image models of
-the major providers and one aggregator, and writes the date and URL into
-every row.
+The shipped seed is exactly `schema` 1, `currency` `USD`, `as_of` null and
+`"prices": []`. The builder ships no price, not even as a test fixture or
+README example. Import validation rejects any value that is not a decimal
+string, so the placeholders above cannot be loaded by accident. Each
+imported row must carry its own `as_of` and `source`, and the file's
+top-level `as_of` is the oldest row date.
 
 Privacy of the data: no prompt, completion, user input or URL of content
 is stored. `user_id` is an integer only.
@@ -731,10 +814,10 @@ for WordPress functions and an in-memory or SQLite-backed `$wpdb` double.
 | T13 decision filter can deny and releases the reservation; deny to allow is ignored and logged | 13 |
 | T14 dry run writes nothing | 14 |
 | T15 test calls allowed, recorded with `is_test`, excluded from totals; still denied by kill switch | 15 |
-| T16 record via action and via function, row id returned | 16 |
+| T16 record via action and via function, row id returned; invalid call gives -1 and writes nothing; failed write gives 0 | 16 |
 | T17 settling a reservation updates in place | 17 |
 | T18 second record on the same reservation adds a linked row | 18 |
-| T19 record without reservation sets the unreserved flag | 19 |
+| T19 record without, or with an unknown or released, reservation sets the unreserved flag | 19 |
 | T20 cost source precedence, all four branches | 20 |
 | T21 provider cost and table cost both stored | 21 |
 | T22 each status value stored and validated | 22 |
@@ -763,9 +846,9 @@ for WordPress functions and an in-memory or SQLite-backed `$wpdb` double.
 | T45 a call recorded after a kill switch flips is still settled | 45 |
 | T46 expired reservations excluded from totals before cron runs, marked by cron | 46 |
 | T47 release sets `released` and zero cost | 47 |
-| T48 unknown or settled reservation release and record are no-ops | 48 |
+| T48 release of an unknown or settled reservation is a no-op; record of one is never dropped | 48 |
 | T49 price row with every field priced correctly | 49 |
-| T50 seed file validates, has `as_of` and a source per row | 50 |
+| T50 shipped seed validates, has an empty `prices` array and no price anywhere in the repository fixtures; example file fails import on purpose; empty table raises the "no prices loaded" warning | 50 |
 | T51 override beats seed; seed replacement keeps overrides | 51 |
 | T52 changing a price changes `price_version` and no old row | 52 |
 | T53 exact match, longest prefix match, no default price | 53 |
@@ -773,7 +856,7 @@ for WordPress functions and an in-memory or SQLite-backed `$wpdb` double.
 | T55 one bad row rejects the import with errors; dry run shows diff | 55 |
 | T56 merge and replace modes | 56 |
 | T57 wrong currency rejected | 57 |
-| T58 stale prices flagged | 58 |
+| T58 stale prices flagged; empty table shows the notice | 58 |
 | T59 reprice fills only unpriced rows | 59 |
 | T60 widget summary values and warnings | 60 |
 | T61 widget hidden without the capability | 61 |
@@ -791,6 +874,8 @@ for WordPress functions and an in-memory or SQLite-backed `$wpdb` double.
 | T73 each failure mode row in section 4.12 | 4.12 |
 | T74 missing column after upgrade denies with `ledger_unavailable` and shows a notice | section 6 |
 | T75 uninstall removes options and table; keeps the table when asked | section 6 |
+| T76 `SPEND_METER_API` is defined at load as an integer; hooks exist on `plugins_loaded`; decision carries `api`; every deny carries all decision keys; unknown reason handling documented | 5.1, 5.2 |
+| T77 a second plugin using only hooks (check, record, release, cap and kill actions) works against the documented shapes, with the plugin absent and present | 5.1 to 5.4 |
 
 ## 13. Open questions
 
@@ -799,15 +884,17 @@ The builder answers each in `docs/ARCHITECTURE.md`.
 1. Test double for `$wpdb`: SQLite through PDO, or a purpose-built
    in-memory fake? The race test (T11) needs real interleaving of insert
    and sum.
-2. Default unpriced policy: `deny` is specified. Confirm it does not make
-   first-run setup painful; if it does, consider a first-run notice rather
-   than changing the default.
+2. Default unpriced policy: `deny` is specified, and the shipped table is
+   empty, so every call is denied until prices are loaded. The first-run
+   notice is specified (case 50). Confirm the notice and the example file
+   make first run clear enough, without changing the default.
 3. Whether `spend_meter_record()` should return the cost as well as the
    id (an array) or keep a plain int and offer a separate getter.
 4. Network caps: computed live from the shared table (specified), or
    cached per minute on large networks? Measure on a million-row fixture.
-5. Seed coverage: which providers and models go into `data/prices.json` for
-   0.1.0, and how the README tells operators the date it was read.
+5. How the README tells operators to find, date and import their own
+   prices, and whether `prices import` should also accept a pasted table
+   in the admin screen.
 6. Should the reservation lifetime be per intent (a long batch call) as
    well as global? If yes, cap it at the global maximum.
 7. Whether to ship a small read-only REST route for the widget data, or
@@ -830,7 +917,8 @@ production.
    unpriced, loudly. A made-up fallback price makes the ledger wrong with
    no warning.
 5. **Prices are data with a date, not code.** A hard-coded table with an
-   "update here" comment goes stale the day a provider changes a price.
+   "update here" comment goes stale the day a provider changes a price. The
+   plugin ships the format, and the operator owns the numbers.
 6. **Prefer the billed cost when the provider reports it,** and keep the
    table cost beside it so drift is visible.
 7. **Read both usage shapes, and treat cached and reasoning tokens as
