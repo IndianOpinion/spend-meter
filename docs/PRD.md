@@ -557,7 +557,8 @@ spend-meter and are invalid here. Unknown call keys are ignored.
 | `spend_meter_capability` | filter | `string $cap` | Default `manage_options` |
 | `spend_meter_default_settings` | filter | `array $defaults` | Change any default in section 7 |
 | `spend_meter_price` | filter | `?array $price, string $provider, string $model` | Last-chance price lookup override |
-| `spend_meter_widget_rows` | filter | `array $rows` | Add lines to the widget |
+| `spend_meter_widget_rows` | filter | `array $rows` | Add lines to the widget. Each row is an array with scalar `label` and `value` |
+| `spend_meter_reservation_lifetime` | filter | `int $minutes` | Reservation lifetime in minutes, clamped to 1 to 120. Added at build |
 
 ### 5.5 Helper functions
 
@@ -609,7 +610,10 @@ Options (all under one prefix `spend_meter_`, autoload off except the
 settings array): `spend_meter_settings`, `spend_meter_caps`,
 `spend_meter_kill`, `spend_meter_prices_override`,
 `spend_meter_db_version`, `spend_meter_alert_state`, `spend_meter_last_cron`,
-`spend_meter_record_losses`. Network options for network caps on multisite.
+`spend_meter_record_losses`, `spend_meter_denials` (denial counters, added
+at build). There is one ledger per network, so on multisite every one of
+these is a network option (caps keep site caps keyed by blog id inside the
+one option); on a single site they are normal options.
 
 Constants: `SPEND_METER_KILL` (bool), `SPEND_METER_KILL_PURPOSES`
 (string), `SPEND_METER_API` (int, defined by the plugin),
@@ -625,6 +629,7 @@ differs:
 |---|---|---|
 | `id` | BIGINT UNSIGNED AUTO_INCREMENT | Primary key |
 | `call_id` | CHAR(36) | UUID; unique |
+| `reservation_id` | CHAR(36) NULL | The reservation id from the decision, on the reservation row and on every linked retry; null on unreserved rows. Added at build (ARCHITECTURE.md) |
 | `parent_id` | BIGINT UNSIGNED NULL | Earlier attempt of the same reservation |
 | `blog_id` | BIGINT UNSIGNED | 1 on single site |
 | `created_at` | DATETIME | UTC |
@@ -653,9 +658,15 @@ differs:
 | `user_id` | BIGINT UNSIGNED NULL | Current user if any, 0 for cron and CLI |
 | `meta` | TEXT NULL | JSON, section 5.2 limits |
 
-Indexes: unique (`call_id`); (`blog_id`, `day`, `purpose`);
-(`blog_id`, `month`, `purpose`); (`day`); (`status`, `created_at`) for
-reservation expiry.
+Indexes: unique (`call_id`); (`reservation_id`); (`blog_id`, `day`,
+`purpose`); (`blog_id`, `month`, `purpose`, `is_test`, `day`, `status`,
+`created_at`, `estimate`, `cost`), covering the site and purpose totals;
+(`day`); (`month`, `is_test`, `day`, `status`, `created_at`, `estimate`,
+`cost`), covering the network totals; (`status`, `created_at`) for
+reservation expiry. The `reservation_id` column and the two covering
+indexes were added at build; the measurement and reasons are in
+`docs/ARCHITECTURE.md`. Adding a column or an index is not a breaking
+change (section 5.1).
 
 After a schema upgrade the plugin verifies every expected column with
 `SHOW COLUMNS` and, if one is missing, shows an admin notice and denies
